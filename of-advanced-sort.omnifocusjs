@@ -1,0 +1,300 @@
+/*{
+    "type": "action",
+    "targets": ["omnifocus"],
+    "author": "Jon Stacey",
+    "identifier": "com.jonstacey.of.advanced-sort",
+    "version": "1.1",
+    "description": "Retrieves tasks from a perspective, sorts by urgency and priority tag, and writes estimated-minute durations.",
+    "label": "Advanced Sort",
+    "shortLabel": "Advanced Sort",
+    "paletteLabel": "Advanced Sort",
+    "image": "table"
+}*/
+(() => {
+    "use strict";
+
+    const action = new PlugIn.Action(async function(selection, sender) {
+
+        // ════════════════════════════════════════════════════════════════
+        //  Configuration — edit these before running
+        // ════════════════════════════════════════════════════════════════
+
+        var PERSPECTIVE  = "Today";
+        var T0           = new Date();
+        var DRY_RUN      = false;   // true = preview only, false = write durations
+        var STEP_MINUTES = 10;
+
+        // ════════════════════════════════════════════════════════════════
+        //  Pipeline
+        // ════════════════════════════════════════════════════════════════
+
+        var TAG_PRIORITY = { "1️⃣ First": 1, "2️⃣ Next": 2, "3️⃣ Later": 3 };
+        var UNTAGGED     = 4;
+        var BUCKET_LABELS = [
+            "Overdue",
+            "Due Today — available now",
+            "Planned",
+            "Due Today — not yet available",
+        ];
+        var TAG_LABEL = { "1": "1️⃣ First", "2": "2️⃣ Next", "3": "3️⃣ Later" };
+
+        try {
+
+            // ── Perspective retrieval ─────────────────────────────────────────
+
+            var win = document.windows[0];
+            var perspective = Perspective.Custom.all.find(function(p) {
+                return p.name === PERSPECTIVE;
+            });
+            if (!perspective) {
+                throw new Error("Perspective not found: " + PERSPECTIVE);
+            }
+            var previous = win.perspective;
+            win.perspective = perspective;
+
+            function collectTasks(node) {
+                var result = [];
+                if (node.object instanceof Task) result.push(node.object);
+                var children = node.children || [];
+                for (var i = 0; i < children.length; i++) {
+                    var sub = collectTasks(children[i]);
+                    for (var j = 0; j < sub.length; j++) result.push(sub[j]);
+                }
+                return result;
+            }
+
+            var rawTasks = collectTasks(win.content.rootNode);
+            win.perspective = previous;
+
+            // ── Map to plain objects ──────────────────────────────────────────
+
+            function mapTask(t) {
+                var s = t.taskStatus;
+                var statusStr = s === Task.Status.Available  ? "available" :
+                                s === Task.Status.Overdue    ? "overdue"   :
+                                s === Task.Status.DueSoon    ? "dueSoon"   :
+                                s === Task.Status.Blocked    ? "blocked"   :
+                                s === Task.Status.Completed  ? "completed" :
+                                s === Task.Status.Dropped    ? "dropped"   : "unknown";
+                var isSeqChild = t.parent instanceof Task && t.parent.sequential;
+                return {
+                    id:               t.id.primaryKey,
+                    name:             t.name,
+                    dueDate:          t.effectiveDueDate   ? t.effectiveDueDate.toISOString()   : null,
+                    deferDate:        t.effectiveDeferDate ? t.effectiveDeferDate.toISOString() : null,
+                    taskStatus:       statusStr,
+                    available:        statusStr === "available" || statusStr === "overdue" || statusStr === "dueSoon",
+                    flagged:          t.effectiveFlagged,
+                    tags:             t.tags.map(function(tag) { return tag.name; }),
+                    project:          t.containingProject ? t.containingProject.name : "Inbox",
+                    isSequentialChild: isSeqChild,
+                    parentId:         isSeqChild ? t.parent.id.primaryKey : null,
+                };
+            }
+
+            var tasks = [];
+            for (var i = 0; i < rawTasks.length; i++) {
+                var mt = mapTask(rawTasks[i]);
+                mt.originalIndex = i;
+                tasks.push(mt);
+            }
+
+            // ── Sort by bucket → tag priority ─────────────────────────────────
+
+            var now = new Date();
+            var todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            var todayEnd   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+            function getBucket(task) {
+                var due = task.dueDate ? new Date(task.dueDate) : null;
+                var isDueToday = due && due >= todayStart && due <= todayEnd;
+                if (task.taskStatus === "overdue")            return 0;
+                if (due && due < todayStart)                  return 0;
+                if (isDueToday && task.available)             return 1;
+                if (isDueToday && !task.available)            return 3;
+                return 2;
+            }
+
+            function getTagPriority(tags) {
+                var best = UNTAGGED;
+                for (var i = 0; i < tags.length; i++) {
+                    var p = TAG_PRIORITY[tags[i]];
+                    if (p !== undefined && p < best) best = p;
+                }
+                return best;
+            }
+
+            var bucketCounts = [0, 0, 0, 0];
+            for (var i = 0; i < tasks.length; i++) {
+                var t = tasks[i];
+                t.bucket      = getBucket(t);
+                t.tagPriority = getTagPriority(t.tags);
+                bucketCounts[t.bucket]++;
+            }
+
+            // ── Pre-compute group effective priority for sequential children ───
+            //    All siblings share the best (lowest) tag priority in the group
+            //    so the group sorts as a unit and can't be split by a mid-priority
+            //    task falling between two siblings.
+
+            var groupTagPriority = {};
+            for (var i = 0; i < tasks.length; i++) {
+                if (tasks[i].isSequentialChild && tasks[i].parentId) {
+                    var pid = tasks[i].parentId;
+                    if (groupTagPriority[pid] === undefined || tasks[i].tagPriority < groupTagPriority[pid]) {
+                        groupTagPriority[pid] = tasks[i].tagPriority;
+                    }
+                }
+            }
+
+            function effectivePriority(t) {
+                return (t.isSequentialChild && t.parentId && groupTagPriority[t.parentId] !== undefined)
+                    ? groupTagPriority[t.parentId]
+                    : t.tagPriority;
+            }
+
+            tasks.sort(function(a, b) {
+                if (a.bucket !== b.bucket) return a.bucket - b.bucket;
+                // Same-parent sequential siblings always keep their original order
+                if (a.isSequentialChild && b.isSequentialChild && a.parentId !== null && a.parentId === b.parentId) {
+                    return a.originalIndex - b.originalIndex;
+                }
+                // All other tasks sort by effective (group) priority, then flagged
+                var ap = effectivePriority(a), bp = effectivePriority(b);
+                if (ap !== bp) return ap - bp;
+                if (a.flagged !== b.flagged) return a.flagged ? -1 : 1;
+                return 0;
+            });
+
+            // ── Apply estimated minutes (single flattenedTasks scan) ──────────
+
+            var ok = 0, missing = 0;
+
+            if (!DRY_RUN) {
+                var map = {};
+                var allTasks = flattenedTasks;
+                for (var i = 0; i < allTasks.length; i++) {
+                    map[allTasks[i].id.primaryKey] = allTasks[i];
+                }
+
+                var seqGroupMins = {};
+                for (var i = 0; i < tasks.length; i++) {
+                    var taskObj = map[tasks[i].id];
+                    if (!taskObj) {
+                        missing++;
+                        continue;
+                    }
+                    if (tasks[i].isSequentialChild && tasks[i].parentId !== null) {
+                        var pid = tasks[i].parentId;
+                        if (seqGroupMins[pid] === undefined) seqGroupMins[pid] = (i + 1) * STEP_MINUTES;
+                        taskObj.estimatedMinutes = seqGroupMins[pid];
+                    } else {
+                        taskObj.estimatedMinutes = (i + 1) * STEP_MINUTES;
+                    }
+                    ok++;
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            //  Output — console (Automation Console) + alert (dialog)
+            // ════════════════════════════════════════════════════════════════
+
+            var lines = [];
+            var mode  = DRY_RUN ? "DRY RUN — no changes written" : "LIVE — durations written";
+
+            lines.push("");
+            lines.push("╔══════════════════════════════════════════════════════╗");
+            lines.push("║  Advanced Sort  —  " + mode.padEnd(36) + "║");
+            lines.push("╚══════════════════════════════════════════════════════╝");
+            lines.push("");
+            lines.push("Perspective: " + PERSPECTIVE);
+            lines.push("Tasks retrieved: " + tasks.length);
+            lines.push("");
+
+            // Bucket summary
+            lines.push("── Bucket counts ──────────────────────────");
+            for (var b = 0; b < BUCKET_LABELS.length; b++) {
+                var n = bucketCounts[b] || 0;
+                if (n > 0) lines.push("  " + b + ": " + BUCKET_LABELS[b] + " — " + n);
+            }
+
+            // Sorted detail
+            lines.push("");
+            lines.push("Proposed sort order — " + tasks.length + " tasks");
+            lines.push("");
+
+            var cur = -1;
+            var displaySeqGroupMins = {};
+            for (var i = 0; i < tasks.length; i++) {
+                var t    = tasks[i];
+                var mins;
+                if (t.isSequentialChild && t.parentId !== null) {
+                    var pid = t.parentId;
+                    if (displaySeqGroupMins[pid] === undefined) displaySeqGroupMins[pid] = (i + 1) * STEP_MINUTES;
+                    mins = displaySeqGroupMins[pid];
+                } else {
+                    mins = (i + 1) * STEP_MINUTES;
+                }
+                var tag  = TAG_LABEL[String(t.tagPriority)] || "untagged";
+                var flag = t.flagged ? " 🚩" : "";
+
+                if (t.bucket !== cur) {
+                    cur = t.bucket;
+                    var bc = bucketCounts[cur];
+                    lines.push("");
+                    lines.push("  ── Bucket " + cur + ": " + BUCKET_LABELS[cur] + " (" + bc + ") ──");
+                }
+                lines.push(
+                    "  " + String(i + 1).padStart(3) + "." +
+                    "  [" + String(mins).padStart(3) + " min]" +
+                    "  " + (t.name || "(unnamed)").padEnd(50) +
+                    "  [" + tag + "]" + flag
+                );
+            }
+
+            if (!DRY_RUN) {
+                lines.push("");
+                lines.push("✅  Done — " + ok + " tasks updated" +
+                    (missing ? ", " + missing + " tasks not found in DB" : "") + ".");
+            } else {
+                lines.push("");
+                lines.push("ℹ️  Dry run — set DRY_RUN = false to write durations.");
+            }
+            lines.push("");
+
+            // Write to Automation Console
+            for (var i = 0; i < lines.length; i++) {
+                console.log(lines[i]);
+            }
+
+            // Show alert with summary
+            var summary = "Perspective: " + PERSPECTIVE + "\n" +
+                          "Tasks: " + tasks.length + "\n" +
+                          "Buckets\n";
+            for (var b = 0; b < BUCKET_LABELS.length; b++) {
+                var n = bucketCounts[b] || 0;
+                if (n > 0) summary += "  " + b + ": " + BUCKET_LABELS[b] + ": " + n + "\n";
+            }
+            var elapsed = ((new Date() - T0) / 1000).toFixed(1);
+
+            if (!DRY_RUN) {
+                summary += "\n✅ " + ok + " task" + (ok === 1 ? "" : "s") + " durations written in " + elapsed + "s";
+            } else {
+                summary += "\nℹ️  Dry run — " + tasks.length + " tasks sorted in " + elapsed + "s";
+            }
+            new Alert("Advanced Sort complete", summary).show();
+
+        } catch (err) {
+            if (!err.causedByUserCancelling) {
+                console.error(err.name, err.message);
+                new Alert("Advanced Sort error", err.name + ": " + err.message).show();
+            }
+        }
+    });
+
+    action.validate = function(selection, sender) {
+        return true;
+    };
+
+    return action;
+})();
