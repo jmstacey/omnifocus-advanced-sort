@@ -18,7 +18,7 @@ Open the script and edit the constants at the top:
 | Variable | Default | Description |
 |---|---|---|
 | `PERSPECTIVE` | `"Today"` | Name of the perspective to sort |
-| `DRY_UN` | `false` | `true` = preview only, no writes |
+| `DRY_RUN` | `false` | `true` = preview only, no writes |
 | `STEP_MINUTES` | `10` | Minute increment between tasks |
 
 ## Installation
